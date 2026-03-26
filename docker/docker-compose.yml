@@ -1,0 +1,157 @@
+# Variable d'env communes à l'api et au worker
+x-common-variables: &common-variables
+    # On reconstruit l'URL à partir des variables individuelles du .env
+    DATABASE_URL: postgresql://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${DB_NAME}
+    SECRET_KEY: ${API_SECRET_KEY}
+    REDIS_URL: redis://${REDIS_HOST}:${REDIS_PORT}/0
+    AUDIO_STORAGE_PATH: ${AUDIO_STORAGE_PATH}
+
+services:
+  reverse-proxy:
+    image: noeuil/transcribe-ai-reverse-proxy:1.0.0
+    container_name: transcribe-ai-reverse-proxy
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - NGINX_MAX_BODY_SIZE=${NGINX_MAX_BODY_SIZE}
+      - SERVER_NAME=${SERVER_NAME}
+      - SSL_CERT_NAME=${SSL_CERT_NAME}
+      - SSL_KEY_NAME=${SSL_KEY_NAME}
+    volumes:
+      - ${LOCAL_SSL_CERTS_PATH}:/etc/nginx/ssl:ro
+    networks:
+      - transcribe-ai-network
+    depends_on:
+      - frontend
+      - api
+
+  frontend:
+    image: noeuil/transcribe-ai-frontend:1.0.1
+    container_name: transcribe-ai-frontend
+    environment:
+      - REACT_APP_API_KEY=${API_SECRET_KEY}
+      - REACT_APP_MAX_SIZE_AUDIO_BATCH=${FRONTEND_MAX_AUDIO_SIZE_BATCH}
+      - REACT_APP_MAX_TIME_PROCESSING_BATCH=${FRONTEND_MAX_TIME_PROCESSING_BATCH}
+      - REACT_APP_TIME_BETWEEN_EACH_POLLING_BATCH=${FRONTEND_TIME_BETWEEN_EACH_POLLING_BATCH}
+      - REACT_APP_MAX_SIZE_AUDIO_DIARIZATION=${FRONTEND_MAX_AUDIO_SIZE_DIARIZATION}
+      - REACT_APP_MAX_TIME_PROCESSING_DIARIZATION=${FRONTEND_MAX_TIME_PROCESSING_DIARIZATION}
+      - REACT_APP_TIME_BETWEEN_EACH_POLLING_DIARIZATION=${FRONTEND_TIME_BETWEEN_EACH_POLLING_DIARIZATION}
+      - REACT_APP_MAX_SPEAKERS_DIARIZATION=${FRONTEND_MAX_SPEAKERS_DIARIZATION}
+    volumes:
+      - ./volumes/assets:/usr/share/nginx/html/assets:ro
+    networks:
+      - transcribe-ai-network
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:latest
+    container_name: transcribe-ai-postgres
+    environment:
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME}
+    volumes:
+      - postgres_data:${POSTGRES_STORAGE_PATH}
+    networks:
+      - transcribe-ai-network
+
+  redis:
+    image: redis:latest
+    container_name: transcribe-ai-redis
+    networks:
+      - transcribe-ai-network
+
+  api:
+    image: noeuil/transcribe-ai-api:1.0.0
+    container_name: transcribe-ai-api
+    environment:
+      <<: *common-variables
+      MAX_AUDIO_SIZE_MB: ${MAX_AUDIO_SIZE_MB}
+    volumes:
+      - audio_data:${AUDIO_STORAGE_PATH}
+    networks:
+      - transcribe-ai-network
+    restart: on-failure
+    depends_on:
+      - postgres
+      - redis
+  mono-voice-worker:
+    image: noeuil/transcribe-ai-mono-voice-worker:1.0.0
+    container_name: transcribe-ai-mono-voice-worker
+    environment:
+      <<: *common-variables
+      PYTHONUNBUFFERED: 1
+      WHISPER_SERVICE_URL: ${MONO_VOICE_STT_URL}
+    volumes:
+      - audio_data:${AUDIO_STORAGE_PATH}
+    networks:
+      - transcribe-ai-network
+    depends_on:
+      - postgres
+      - redis
+      - mono-voice-stt
+
+  multi-voice-worker:
+    image: noeuil/transcribe-ai-multi-voice-worker:1.0.0
+    container_name: transcribe-ai-multi-voice-worker
+    environment:
+      <<: *common-variables
+      PYTHONUNBUFFERED: 1
+      WHISPERX_SERVICE_URL: ${MULTI_VOICE_STT_URL}
+    volumes:
+      - audio_data:${AUDIO_STORAGE_PATH}
+    networks:
+      - transcribe-ai-network
+    depends_on:
+      - postgres
+      - redis
+      - multi-voice-stt
+
+  mono-voice-stt:
+    image: noeuil/transcribe-ai-mono-voice-stt:1.0.0
+    container_name: transcribe-ai-mono-voice-stt
+    environment:
+      - ASR_MODEL_PATH=${MODELS_STORAGE_PATH}
+      - ASR_MODEL_NAME=${MODEL_NAME_MONO_VOICE}
+    volumes:
+      - models_data:${MODELS_STORAGE_PATH}
+    networks:
+      - transcribe-ai-network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  multi-voice-stt:
+    image: noeuil/transcribe-ai-multi-voice-stt:v1.0.0
+    container_name: transcribe-ai-multi-voice-stt
+    environment:
+      - ASR_MODEL_PATH=${MODELS_STORAGE_PATH}
+      - ASR_MODEL_NAME=${ASR_MODEL_NAME_MULTI_VOICE}
+      - HF_HOME=${HF_HOME}
+      - TORCH_HOME=${TORCH_HOME}
+      - HF_TOKEN=${HF_TOKEN}
+    volumes:
+      - models_data:${MODELS_STORAGE_PATH}
+    networks:
+      - transcribe-ai-network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  postgres_data:
+  audio_data:
+  models_data:
+
+networks:
+  transcribe-ai-network:
+    driver: bridge
